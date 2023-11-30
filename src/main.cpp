@@ -1,16 +1,24 @@
+// Arduino imports
 #include <Arduino.h>
-#include <WiFiNINA.h>
-#include <ArduinoHA.h>
-#include <secrets.h>
 #include <SPI.h>
 
+// Third party imports
+#include "Sodaq_wdt.h"
+#include <WiFiNINA.h>
+#include <ArduinoHA.h>
+
+// Local imports
+#include <secrets.h>
+
+// Constants
 #define RED_PIN 3
 #define GREEN_PIN 5
 #define BLUE_PIN 6
-#define BROKER_ADDR     IPAddress(192,168,1,162)
 
+#define WIFI_TIMEOUT 60
+#define HA_TIMEOUT 120
 
-
+// Services
 WiFiClient client;
 HADevice device;
 HAMqtt mqtt(client, device);
@@ -18,8 +26,13 @@ HAMqtt mqtt(client, device);
 // HALight::BrightnessFeature enables support for setting brightness of the light.
 // HALight::ColorTemperatureFeature enables support for setting color temperature of the light.
 // Both features are optional and you can remove them if they're not needed.
-// "prettyLight" is unique ID of the light. You should define your own ID.
-HALight light("prettyLight", HALight::BrightnessFeature | HALight::ColorTemperatureFeature | HALight::RGBFeature);
+// "bedroom_ili_2" is unique ID of the light. You should define your own ID.
+HALight light("bedroom_ili", HALight::BrightnessFeature | HALight::RGBFeature);
+
+
+uint32_t lastWDT = 0;
+uint32_t lastWifiConnection = 0;
+uint32_t lastHaConnection = 0;
 
 HALight::RGBColor temperatureToRGB(uint16_t temperature) {
   HALight::RGBColor color;
@@ -45,22 +58,116 @@ HALight::RGBColor temperatureToRGB(uint16_t temperature) {
   return color;
 }
 
+// A random number used to validate the integrity of the values in InitialConfig
+#define MEMORY_ID 478295
+
+struct InitialConfig
+{
+    int id;
+    HALight::RGBColor color;
+    uint8_t brightness;
+    bool state;
+    void init() { id = MEMORY_ID; }
+    operator bool() { return id == MEMORY_ID; }
+    void updateLED()
+    {
+        if (state)
+        {
+            float b = brightness/255.;
+            color = HALight::RGBColor((uint8_t)(color.red*b), (uint8_t)(color.green*b), (uint8_t)(color.blue*b));
+            analogWrite(RED_PIN, color.red);
+            analogWrite(GREEN_PIN, color.green);
+            analogWrite(BLUE_PIN, color.blue);
+        }
+        else
+        {
+            analogWrite(RED_PIN, 0);
+            analogWrite(GREEN_PIN, 0);
+            analogWrite(BLUE_PIN, 0);
+        }
+    }
+};
+
+InitialConfig* initConfig = nullptr;
+
+void forceExit()
+{
+    Serial.println("Restarting");
+    Serial.flush();
+    sodaq_wdt_disable();
+    sodaq_wdt_enable(WDT_PERIOD_1DIV64);
+    exit(1);
+}
+
+void update()
+{
+    if (millis() - lastWDT > 1000)
+    {
+        sodaq_wdt_reset();
+        lastWDT = millis();
+    }
+}
+
+void safeDelay(uint32_t ms)
+{
+    uint32_t end = millis() + ms;
+    while (millis() < end) update();
+}
+
+bool ensureConnected()
+{
+    if (WiFi.status() == wl_status_t::WL_CONNECTED)
+    {
+        lastWifiConnection = millis();
+        return true;
+    }
+    if (millis() - lastWifiConnection > WIFI_TIMEOUT) 
+    {
+        forceExit();
+    }
+
+    // connect to wifi
+    const char* wifi_ssid = WIFI_SSID;
+    const char* wifi_password = WIFI_PASSWORD;
+    WiFi.begin(wifi_ssid, wifi_password);
+    safeDelay(500); // waiting for the connection
+    return false;
+}
+
+void mqttUpdate()
+{
+    mqtt.loop();
+    sodaq_wdt_reset();
+    if (mqtt.isConnected())
+    {
+        lastHaConnection = millis();
+    }
+    else
+    {
+        if (millis() - lastHaConnection > HA_TIMEOUT) 
+        {
+            forceExit();
+        }
+    }
+}
+
 void onStateCommand(bool state, HALight* sender) {
     Serial.print("State: ");
     Serial.println(state);
 
     sender->setState(state); // report state back to the Home Assistant
+    initConfig->state = state;
+    initConfig->updateLED();
 }
 
 void onBrightnessCommand(uint8_t brightness, HALight* sender) {
     Serial.print("Brightness: ");
     Serial.println(brightness);
+
     auto color = light.getCurrentRGBColor();
-    float b = brightness/255.;
-    color = HALight::RGBColor((uint8_t)(color.red*b), (uint8_t)(color.green*b), (uint8_t)(color.blue*b));
-    analogWrite(RED_PIN, color.red);
-    analogWrite(GREEN_PIN, color.green);
-    analogWrite(BLUE_PIN, color.blue);
+    initConfig->brightness = brightness;
+    initConfig->color = color;
+    initConfig->updateLED();
 
     sender->setBrightness(brightness); // report brightness back to the Home Assistant
 }
@@ -75,6 +182,7 @@ void onColorTemperatureCommand(uint16_t temperature, HALight* sender) {
     analogWrite(BLUE_PIN, color.blue);
 
     sender->setColorTemperature(temperature); // report color temperature back to the Home Assistant
+    initConfig->color = color;
 }
 
 void onRGBColorCommand(HALight::RGBColor color, HALight* sender) {
@@ -85,59 +193,61 @@ void onRGBColorCommand(HALight::RGBColor color, HALight* sender) {
     Serial.print("Blue: ");
     Serial.println(color.blue);
 
-    analogWrite(RED_PIN, color.red);
-    analogWrite(GREEN_PIN, color.green);
-    analogWrite(BLUE_PIN, color.blue);
+    initConfig->color = color;
+    initConfig->updateLED();
 
     sender->setRGBColor(color); // report color back to the Home Assistant
+
 }
 
 void setup() 
 {
+    initConfig = (InitialConfig*)malloc(sizeof(InitialConfig));
+    pinMode(RED_PIN, OUTPUT);
+    pinMode(GREEN_PIN, OUTPUT);
+    pinMode(BLUE_PIN, OUTPUT);
+    if (*initConfig)
+    {
+        initConfig->updateLED();
+    }
+    sodaq_wdt_enable(WDT_PERIOD_2X);
     Serial.begin(9600);
     for (int i = 0; i < 10 && !Serial; ++i)
     {
-        delay(100);
+        safeDelay(100);
     }
-
+    safeDelay(100);
+    Serial.print("ID: ");
+    Serial.println(initConfig->id);
+    Serial.print("Init: ");
+    Serial.println(*initConfig);
+    Serial.print("R: "); Serial.print(initConfig->color.red); Serial.print("  G: "); Serial.print(initConfig->color.green); Serial.print("  B: "); Serial.println(initConfig->color.blue);
     
     Serial.println("Starting...");
 
+    sodaq_wdt_reset();
     // Unique ID must be set!
     byte mac[WL_MAC_ADDR_LENGTH];
     WiFi.macAddress(mac);
     device.setUniqueId(mac, sizeof(mac));
-    Serial.print("MAC:");
-    Serial.print(mac[0],HEX); Serial.print(':');
-    Serial.print(mac[1],HEX); Serial.print(':');
-    Serial.print(mac[2],HEX); Serial.print(':');
-    Serial.print(mac[3],HEX); Serial.print(':');
-    Serial.print(mac[4],HEX); Serial.print(':');
-    Serial.println(mac[5],HEX);
-
-    pinMode(RED_PIN, OUTPUT);
-    pinMode(GREEN_PIN, OUTPUT);
-    pinMode(BLUE_PIN, OUTPUT);
+    sodaq_wdt_reset();
+    
 
     // connect to wifi
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) 
-    {
-        Serial.print(".");
-        delay(500); // waiting for the connection
-    }
+    lastWifiConnection = millis();
+    while (!ensureConnected()) sodaq_wdt_reset();
     Serial.println();
     Serial.println("Connected to the network");
 
     // set device's details (optional)
     device.setName("Nano 33 IoT");
-    device.setSoftwareVersion("1.0.0");
+    device.setSoftwareVersion("1.1.0");
 
     // configure light (optional)
     light.setName("Bedroom Ili");
 
     // Optionally you can set retain flag for the HA commands
-    // light.setRetain(true);
+    light.setRetain(true);
 
     // Maximum brightness level can be changed as follows:
     // light.setBrightnessScale(50);
@@ -153,24 +263,59 @@ void setup()
     // handle light states
     light.onStateCommand(onStateCommand);
     light.onBrightnessCommand(onBrightnessCommand); // optional
-    light.onColorTemperatureCommand(onColorTemperatureCommand); // optional
+    // light.onColorTemperatureCommand(onColorTemperatureCommand); // optional
     light.onRGBColorCommand(onRGBColorCommand); // optional
 
+
     mqtt.begin(BROKER_ADDR, BROKER_USERNAME, BROKER_PASSWORD);
+
+    // Wait until mqtt is connected.
+    lastHaConnection = millis();
+    while (!mqtt.isConnected()) mqttUpdate();
+    Serial.println("Connected to mqtt");
+
+    // mqtt.addDeviceType(&light);
+
+    if (*initConfig)
+    {
+        light.setCurrentRGBColor(initConfig->color);
+        light.setCurrentBrightness(initConfig->brightness);
+        light.setCurrentState(initConfig->state);
+    }
+    else
+    {
+        initConfig->init();
+        initConfig->brightness = light.getCurrentBrightness();
+        initConfig->state = light.getCurrentState();
+        initConfig->color = light.getCurrentRGBColor();
+        initConfig->updateLED();
+    }
+
+    
 }
 
-void ensureConnected()
-{
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
-}
+
 
 void loop() 
 {
     mqtt.loop();
     ensureConnected();
+    mqttUpdate();
+    if (Serial.available())
+    {
+        long c = Serial.parseInt();
+        switch (c)
+        {
+        case 1: // Erase RAM config
+            initConfig->id = 0;
+            forceExit();
+            break;
+        default:
+            break;
+        }
+        while (Serial.available()) Serial.read();
+        Serial.println("Command done");
+    }
 
     // You can also change the state at runtime as shown below.
     // This kind of logic can be used if you want to control your switch using a button connected to the device.
