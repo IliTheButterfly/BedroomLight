@@ -15,8 +15,8 @@
 #define GREEN_PIN 5
 #define BLUE_PIN 6
 
-#define WIFI_TIMEOUT 60
-#define HA_TIMEOUT 120
+#define WIFI_TIMEOUT 240
+#define HA_TIMEOUT 480
 
 // Services
 WiFiClient client;
@@ -266,7 +266,6 @@ void setup()
     // light.onColorTemperatureCommand(onColorTemperatureCommand); // optional
     light.onRGBColorCommand(onRGBColorCommand); // optional
 
-
     mqtt.begin(BROKER_ADDR, BROKER_USERNAME, BROKER_PASSWORD);
 
     // Wait until mqtt is connected.
@@ -316,8 +315,4 @@ void loop()
         while (Serial.available()) Serial.read();
         Serial.println("Command done");
     }
-
-    // You can also change the state at runtime as shown below.
-    // This kind of logic can be used if you want to control your switch using a button connected to the device.
-    // led.setState(true); // use any state you want
 }
