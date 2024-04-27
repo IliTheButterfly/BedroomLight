@@ -9,14 +9,15 @@
 
 // Local imports
 #include <secrets.h>
+#include <common.h>
 
 // Constants
 #define RED_PIN 3
 #define GREEN_PIN 5
 #define BLUE_PIN 6
 
-#define WIFI_TIMEOUT 240
-#define HA_TIMEOUT 480
+#define WIFI_TIMEOUT 240000
+#define HA_TIMEOUT 480000
 
 // Services
 WiFiClient client;
@@ -88,12 +89,24 @@ struct InitialConfig
     }
 };
 
+struct LED
+{
+    pin_size_t pin;
+    int status = 0;
+    LED(pin_size_t p) : pin(p) {}
+    void begin() { pinMode(pin, PinMode::OUTPUT); }
+    void write(int status) { digitalWrite(pin, status); this->status=status; }
+    void on() { write(HIGH); }
+    void off() { write(LOW); }
+};
+
 InitialConfig* initConfig = nullptr;
+LED led{LED_BUILTIN};
 
 void forceExit()
 {
-    Serial.println("Restarting");
-    Serial.flush();
+    dbgln("Restarting");
+    dbgflush();
     sodaq_wdt_disable();
     sodaq_wdt_enable(WDT_PERIOD_1DIV64);
     exit(1);
@@ -119,8 +132,10 @@ bool ensureConnected()
     if (WiFi.status() == wl_status_t::WL_CONNECTED)
     {
         lastWifiConnection = millis();
+        led.on();
         return true;
     }
+    led.off();
     if (millis() - lastWifiConnection > WIFI_TIMEOUT) 
     {
         forceExit();
@@ -152,8 +167,8 @@ void mqttUpdate()
 }
 
 void onStateCommand(bool state, HALight* sender) {
-    Serial.print("State: ");
-    Serial.println(state);
+    dbg("State: ");
+    dbgln(state);
 
     sender->setState(state); // report state back to the Home Assistant
     initConfig->state = state;
@@ -161,8 +176,8 @@ void onStateCommand(bool state, HALight* sender) {
 }
 
 void onBrightnessCommand(uint8_t brightness, HALight* sender) {
-    Serial.print("Brightness: ");
-    Serial.println(brightness);
+    dbg("Brightness: ");
+    dbgln(brightness);
 
     auto color = light.getCurrentRGBColor();
     initConfig->brightness = brightness;
@@ -173,8 +188,8 @@ void onBrightnessCommand(uint8_t brightness, HALight* sender) {
 }
 
 void onColorTemperatureCommand(uint16_t temperature, HALight* sender) {
-    Serial.print("Color temperature: ");
-    Serial.println(temperature);
+    dbg("Color temperature: ");
+    dbgln(temperature);
     auto color = temperatureToRGB(temperature);
 
     analogWrite(RED_PIN, color.red);
@@ -186,12 +201,12 @@ void onColorTemperatureCommand(uint16_t temperature, HALight* sender) {
 }
 
 void onRGBColorCommand(HALight::RGBColor color, HALight* sender) {
-    Serial.print("Red: ");
-    Serial.println(color.red);
-    Serial.print("Green: ");
-    Serial.println(color.green);
-    Serial.print("Blue: ");
-    Serial.println(color.blue);
+    dbg("Red: ");
+    dbgln(color.red);
+    dbg("Green: ");
+    dbgln(color.green);
+    dbg("Blue: ");
+    dbgln(color.blue);
 
     initConfig->color = color;
     initConfig->updateLED();
@@ -210,20 +225,29 @@ void setup()
     {
         initConfig->updateLED();
     }
-    sodaq_wdt_enable(WDT_PERIOD_2X);
-    Serial.begin(9600);
-    for (int i = 0; i < 10 && !Serial; ++i)
+    else 
+    {
+        initConfig->color = {0,0,0};
+        initConfig->updateLED();
+    }
+    dbginit(9600);
+    led.begin();
+    led.write(LOW);
+    #if defined(DEBUG) && DEBUG > 0
+    for (int i = 0; i < 10 && !dbgstream; ++i)
     {
         safeDelay(100);
     }
+    #endif // defined(DEBUG) && DEBUG > 0
+
     safeDelay(100);
-    Serial.print("ID: ");
-    Serial.println(initConfig->id);
-    Serial.print("Init: ");
-    Serial.println(*initConfig);
-    Serial.print("R: "); Serial.print(initConfig->color.red); Serial.print("  G: "); Serial.print(initConfig->color.green); Serial.print("  B: "); Serial.println(initConfig->color.blue);
+    dbg("ID: ");
+    dbgln(initConfig->id);
+    dbg("Init: ");
+    dbgln(*initConfig);
+    dbg("R: "); dbg(initConfig->color.red); dbg("  G: "); dbg(initConfig->color.green); dbg("  B: "); dbgln(initConfig->color.blue);
     
-    Serial.println("Starting...");
+    dbgln("Starting...");
 
     sodaq_wdt_reset();
     // Unique ID must be set!
@@ -236,12 +260,12 @@ void setup()
     // connect to wifi
     lastWifiConnection = millis();
     while (!ensureConnected()) sodaq_wdt_reset();
-    Serial.println();
-    Serial.println("Connected to the network");
+    dbgln();
+    dbgln("Connected to the network");
 
     // set device's details (optional)
     device.setName("Nano 33 IoT");
-    device.setSoftwareVersion("1.1.0");
+    device.setSoftwareVersion(__XSTRING(VERSION));
 
     // configure light (optional)
     light.setName("Bedroom Ili");
@@ -260,18 +284,20 @@ void setup()
     // light.setMinMireds(50);
     // light.setMaxMireds(200);
 
+    dbgln("Starting MQTT");
+    dbgflush();
+
+    mqtt.begin(BROKER_ADDR, BROKER_USERNAME, BROKER_PASSWORD);
     // handle light states
     light.onStateCommand(onStateCommand);
     light.onBrightnessCommand(onBrightnessCommand); // optional
     // light.onColorTemperatureCommand(onColorTemperatureCommand); // optional
     light.onRGBColorCommand(onRGBColorCommand); // optional
 
-    mqtt.begin(BROKER_ADDR, BROKER_USERNAME, BROKER_PASSWORD);
-
     // Wait until mqtt is connected.
     lastHaConnection = millis();
     while (!mqtt.isConnected()) mqttUpdate();
-    Serial.println("Connected to mqtt");
+    dbgln("Connected to mqtt");
 
     // mqtt.addDeviceType(&light);
 
@@ -290,7 +316,7 @@ void setup()
         initConfig->updateLED();
     }
 
-    
+    sodaq_wdt_enable(WDT_PERIOD_2X);
 }
 
 
@@ -300,6 +326,8 @@ void loop()
     mqtt.loop();
     ensureConnected();
     mqttUpdate();
+
+    #if defined(DEBUG) && DEBUG > 0
     if (Serial.available())
     {
         long c = Serial.parseInt();
@@ -315,4 +343,5 @@ void loop()
         while (Serial.available()) Serial.read();
         Serial.println("Command done");
     }
+    #endif // defined(DEBUG) && DEBUG > 0
 }
